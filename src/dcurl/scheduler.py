@@ -166,11 +166,17 @@ class Watcher:
             log.warning("[%s] статус неизвестен: %s", result.code, result.detail)
             return
 
-        if transition is None:
-            log.debug("[%s] без изменений: %s", result.code, result.status.value)
+        # Логируем все проверенные коды (не только при переходах)
+        if result.status is Status.FREE:
+            if transition is not None:
+                # Только при переходе в FREE логируем WARNING
+                log.warning("[%s] СВОБОДЕН", result.code)
             return
 
-        if result.status is Status.FREE:
-            log.warning("[%s] СВОБОДЕН", result.code)
-        else:
-            log.info("[%s] занят: %s", result.code, describe_taken(result))
+        if result.status is Status.TAKEN:
+            if transition is not None:
+                # При переходе в TAKEN
+                log.info("[%s] занят: %s", result.code, describe_taken(result))
+            else:
+                # При каждой проверке занятого кода
+                log.info("[%s] занят: %s", result.code, describe_taken(result))
