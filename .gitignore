@@ -1,0 +1,17 @@
+# Рабочие файлы, создаются из *.example при первом запуске.
+# В репозиторий попадают только шаблоны.
+config.toml
+.env
+watchlist.txt
+
+# Локальное состояние
+state.json
+history.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
