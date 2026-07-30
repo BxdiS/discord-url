@@ -1,0 +1,11 @@
+# Отслеживаемые коды — по одному на строку.
+# Копируется в watchlist.txt при первом запуске, watchlist.txt в git не попадает.
+#
+# Принимаются любые формы:
+#   discord.com/invite/CODE
+#   https://discord.com/invite/CODE?event=123
+#   discord.gg/CODE
+#   CODE
+# Строки, начинающиеся с #, игнорируются.
+
+discord.gg/discord
