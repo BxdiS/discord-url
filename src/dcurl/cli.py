@@ -112,6 +112,20 @@ def _report_created(created: list[Path]) -> None:
     )
 
 
+async def _check_proxy_health(proxy: str | None) -> bool:
+    """Быстрая проверка прокси (2 сек timeout) перед использованием."""
+    if not proxy:
+        return True
+
+    try:
+        async with build_client(timeout=2.0, proxy=proxy) as http:
+            # Простой HEAD запрос к cloudflare чтобы проверить конектность
+            response = await http.head("https://www.cloudflare.com", follow_redirects=False)
+            return response.status_code < 500
+    except Exception:
+        return False
+
+
 def _make_notifier(config: Config) -> TelegramNotifier | None:
     if not config.telegram.enabled:
         return None
@@ -121,22 +135,42 @@ def _make_notifier(config: Config) -> TelegramNotifier | None:
 async def cmd_check(config: Config, targets: list[str]) -> int:
     codes = _resolve_targets(targets)
     limiter = RateLimiter(config.polling.rate_limit_per_second)
-    proxy_pool = ProxyPool(config.proxy.urls)
 
-    # Начальная прокси (или None если прокси нет)
-    initial_proxy = proxy_pool.next() if proxy_pool.enabled else None
+    proxies = list(config.proxy.urls) if config.proxy.urls else [None]
+    results = []
 
-    async with build_client(proxy=initial_proxy) as http:
-        client = DiscordClient(
-            http,
-            limiter,
-            on_rate_limit=lambda code, delay, scope: log.warning(
-                "[%s] лимит Discord (scope=%s), пауза %.1f с", code, scope, delay
-            ),
-            proxy_pool=proxy_pool,
-        )
-        client._current_proxy = initial_proxy
-        results = [await client.check(code) for code in codes]
+    for code in codes:
+        result = None
+        for proxy_idx, proxy in enumerate(proxies, 1):
+            # Быстрая проверка прокси (2 сек) перед использованием
+            if proxy:
+                is_healthy = await _check_proxy_health(proxy)
+                if not is_healthy:
+                    log.warning(f"[{code}] прокси не отвечает: {proxy[:50]}...")
+                    continue
+                log.debug(f"[{code}] прокси рабочая: {proxy_idx}/{len(proxies)}")
+
+            async with build_client(proxy=proxy) as http:
+                client = DiscordClient(
+                    http,
+                    limiter,
+                    on_rate_limit=lambda c, delay, scope: log.warning(
+                        "[%s] лимит Discord (scope=%s), пауза %.1f с", c, scope, delay
+                    ),
+                )
+                result = await client.check(code)
+
+            if result.status != Status.UNKNOWN or "Timeout" not in (result.detail or ""):
+                break
+
+        if result is None:
+            result = CheckResult(
+                code=code,
+                status=Status.UNKNOWN,
+                detail="не удалось подключиться",
+            )
+
+        results.append(result)
 
     width = max(len(code) for code in codes) + 2
     all_free = True
@@ -170,17 +204,29 @@ async def cmd_watch(config: Config, paths: Paths, targets: list[str]) -> int:
 
     store = Store(paths.state, paths.history)
     limiter = RateLimiter(config.polling.rate_limit_per_second)
-    proxy_pool = ProxyPool(config.proxy.urls)
 
     msg = f"Отслеживается кодов: {len(codes)}, интервал {config.polling.interval_seconds:.0f} с, лимит {config.polling.rate_limit_per_second:.2f} запр/с"
-    if proxy_pool.enabled:
-        msg += f", прокси: {len(config.proxy.urls)} с отказоустойчивостью"
+    if config.proxy.urls:
+        msg += f", прокси: {len(config.proxy.urls)} с ротацией"
     if config.proxy.skip_free_hours > 0:
         msg += f", пропуск свободных: {config.proxy.skip_free_hours:.0f} ч"
     log.info(msg)
 
-    # Начальная прокси (или None если прокси нет)
-    initial_proxy = proxy_pool.next() if proxy_pool.enabled else None
+    # Найти первую рабочую прокси (быстрая проверка 2 сек)
+    initial_proxy = None
+    if config.proxy.urls:
+        log.info("Проверяю прокси...")
+        for idx, proxy in enumerate(config.proxy.urls, 1):
+            if await _check_proxy_health(proxy):
+                initial_proxy = proxy
+                log.info(f"✓ Прокси {idx}/{len(config.proxy.urls)} рабочая")
+                break
+            else:
+                log.warning(f"✗ Прокси {idx}/{len(config.proxy.urls)} не отвечает")
+
+        if not initial_proxy:
+            log.error("Все прокси не работают!")
+            return 1
 
     async with build_client(proxy=initial_proxy) as http:
         client = DiscordClient(
