@@ -20,7 +20,6 @@ import httpx
 
 from . import USER_AGENT
 from .limiter import RateLimiter
-from .proxy_pool import ProxyPool
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 
@@ -131,13 +130,6 @@ def build_client(
     )
 
 
-def build_client_async(
-    timeout: float = 10.0, base_url: str | None = None, proxy: str | None = None
-) -> httpx.AsyncClient:
-    """Асинхронный клиент (дублируется для простоты использования)."""
-    return build_client(timeout=timeout, base_url=base_url, proxy=proxy)
-
-
 class DiscordClient:
     """Проверяет коды, соблюдая общий лимит и паузы после 429."""
 
@@ -148,15 +140,11 @@ class DiscordClient:
         *,
         max_retries: int = 5,
         on_rate_limit=None,
-        proxy_pool: ProxyPool | None = None,
     ) -> None:
         self._http = http
         self._limiter = limiter
         self._max_retries = max_retries
-        # Колбэк для логирования 429 — сам клиент ничего не печатает.
         self._on_rate_limit = on_rate_limit
-        self._proxy_pool = proxy_pool
-        self._current_proxy = None
 
     async def check(self, code: str) -> CheckResult:
         for attempt in range(self._max_retries + 1):
@@ -168,17 +156,8 @@ class DiscordClient:
                 )
             except httpx.HTTPError as exc:
                 error_msg = f"{type(exc).__name__}: {exc}"
-
-                # Отмечаем ошибку прокси если была
-                if self._current_proxy and self._proxy_pool:
-                    self._proxy_pool.record_failure(self._current_proxy, error_msg)
-                    # Переключаемся на следующую прокси, если есть
-                    next_proxy = self._proxy_pool.next()
-                    if next_proxy != self._current_proxy and attempt < self._max_retries:
-                        await self._switch_proxy(next_proxy)
-                        continue
-
-                # Если это последняя попытка или нет прокси для переключения, возвращаем ошибку
+                if attempt < self._max_retries:
+                    continue
                 return CheckResult(
                     code=code,
                     status=Status.UNKNOWN,
@@ -193,10 +172,6 @@ class DiscordClient:
                     self._on_rate_limit(code, delay, scope)
                 continue
 
-            # Успешный результат — отмечаем прокси как рабочую
-            if self._current_proxy and self._proxy_pool:
-                self._proxy_pool.record_success(self._current_proxy)
-
             return self._interpret(code, response)
 
         return CheckResult(
@@ -204,13 +179,6 @@ class DiscordClient:
             status=Status.UNKNOWN,
             detail=f"не удалось получить ответ за {self._max_retries + 1} попыток (429)",
         )
-
-    async def _switch_proxy(self, proxy: str | None) -> None:
-        """Переключается на новую прокси, закрывая старый клиент."""
-        if self._http is not None:
-            await self._http.aclose()
-        self._current_proxy = proxy
-        self._http = build_client(proxy=proxy)
 
     def _interpret(self, code: str, response: httpx.Response) -> CheckResult:
         if response.status_code == 200:
