@@ -32,12 +32,15 @@ class TelegramNotifier:
         *,
         timeout: float = 10.0,
         max_retries: int = 3,
+        proxy: str | None = None,
     ) -> None:
         self._token = token
         self._chat_id = chat_id
         self._max_retries = max_retries
         self._http = httpx.AsyncClient(
-            base_url=f"{API_BASE}/bot{token}", timeout=timeout
+            base_url=f"{API_BASE}/bot{token}",
+            timeout=timeout,
+            proxy=proxy,
         )
 
     async def __aenter__(self) -> TelegramNotifier:

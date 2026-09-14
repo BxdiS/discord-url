@@ -130,13 +130,6 @@ def build_client(
     )
 
 
-def build_client_async(
-    timeout: float = 10.0, base_url: str | None = None, proxy: str | None = None
-) -> httpx.AsyncClient:
-    """Асинхронный клиент (дублируется для простоты использования)."""
-    return build_client(timeout=timeout, base_url=base_url, proxy=proxy)
-
-
 class DiscordClient:
     """Проверяет коды, соблюдая общий лимит и паузы после 429."""
 
@@ -151,21 +144,24 @@ class DiscordClient:
         self._http = http
         self._limiter = limiter
         self._max_retries = max_retries
-        # Колбэк для логирования 429 — сам клиент ничего не печатает.
         self._on_rate_limit = on_rate_limit
 
     async def check(self, code: str) -> CheckResult:
-        for _ in range(self._max_retries + 1):
+        for attempt in range(self._max_retries + 1):
             await self._limiter.acquire()
+
             try:
                 response = await self._http.get(
                     f"/invites/{code}", params={"with_counts": "true"}
                 )
             except httpx.HTTPError as exc:
+                error_msg = f"{type(exc).__name__}: {exc}"
+                if attempt < self._max_retries:
+                    continue
                 return CheckResult(
                     code=code,
                     status=Status.UNKNOWN,
-                    detail=f"сетевая ошибка: {type(exc).__name__}: {exc}",
+                    detail=f"сетевая ошибка: {error_msg}",
                 )
 
             if response.status_code == 429:
