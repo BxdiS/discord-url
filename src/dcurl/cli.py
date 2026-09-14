@@ -13,8 +13,6 @@ from . import __version__
 from .api import DiscordClient, Status, build_client
 from .bootstrap import Paths, ensure_working_files, get_paths, load_dotenv
 from .config import Config, ConfigError, load_config
-from .proxy import ProxyRotator
-from .proxy_pool import ProxyPool
 from .invite import InviteParseError, parse_code, parse_watchlist
 from .limiter import RateLimiter
 from .messages import build_startup_message, describe_taken
@@ -115,28 +113,141 @@ def _report_created(created: list[Path]) -> None:
 def _make_notifier(config: Config) -> TelegramNotifier | None:
     if not config.telegram.enabled:
         return None
-    return TelegramNotifier(config.telegram.bot_token, config.telegram.chat_id)
+
+    proxy = None
+    if config.proxy.use_for_telegram and config.proxy.urls:
+        proxy = config.proxy.urls[0]
+
+    return TelegramNotifier(
+        config.telegram.bot_token,
+        config.telegram.chat_id,
+        proxy=proxy,
+    )
+
+
+class ProxyRotatingClient:
+    """Обёртка над DiscordClient с автоматической ротацией прокси при ошибках."""
+
+    def __init__(
+        self, base_config: Config, limiter: RateLimiter, on_rate_limit=None
+    ) -> None:
+        self._base_config = base_config
+        self._limiter = limiter
+        self._on_rate_limit = on_rate_limit
+        self._proxies = base_config.proxy.urls if base_config.proxy.urls else [None]
+        self._proxy_idx = 0
+        self._http = None
+        self._client = None
+
+    async def _init_proxy(self) -> None:
+        """Инициализирует клиент с текущей прокси."""
+        if self._http:
+            await self._http.aclose()
+        proxy = self._proxies[self._proxy_idx % len(self._proxies)]
+        self._http = build_client(proxy=proxy)
+        self._client = DiscordClient(
+            self._http,
+            self._limiter,
+            on_rate_limit=self._on_rate_limit,
+        )
+
+    async def check(self, code: str) -> CheckResult:
+        """Проверяет код с ротацией прокси при ошибках."""
+        if not self._client:
+            await self._init_proxy()
+
+        for attempt in range(len(self._proxies)):
+            try:
+                result = await self._client.check(code)
+
+                if result.status != Status.UNKNOWN:
+                    return result
+
+                if "Timeout" in (result.detail or ""):
+                    self._proxy_idx += 1
+                    await self._init_proxy()
+                    continue
+
+                return result
+            except Exception as e:
+                self._proxy_idx += 1
+                if attempt < len(self._proxies) - 1:
+                    await self._init_proxy()
+                else:
+                    return CheckResult(
+                        code=code,
+                        status=Status.UNKNOWN,
+                        detail="все прокси не работают",
+                    )
+
+        return CheckResult(
+            code=code,
+            status=Status.UNKNOWN,
+            detail="не удалось подключиться",
+        )
+
+    async def aclose(self) -> None:
+        """Закрывает HTTP клиент."""
+        if self._http:
+            await self._http.aclose()
 
 
 async def cmd_check(config: Config, targets: list[str]) -> int:
     codes = _resolve_targets(targets)
     limiter = RateLimiter(config.polling.rate_limit_per_second)
-    proxy_pool = ProxyPool(config.proxy.urls)
 
-    # Начальная прокси (или None если прокси нет)
-    initial_proxy = proxy_pool.next() if proxy_pool.enabled else None
+    proxies = config.proxy.urls if config.proxy.urls else [None]
+    results = []
 
-    async with build_client(proxy=initial_proxy) as http:
-        client = DiscordClient(
-            http,
-            limiter,
-            on_rate_limit=lambda code, delay, scope: log.warning(
-                "[%s] лимит Discord (scope=%s), пауза %.1f с", code, scope, delay
-            ),
-            proxy_pool=proxy_pool,
-        )
-        client._current_proxy = initial_proxy
-        results = [await client.check(code) for code in codes]
+    for code in codes:
+        result = None
+        for proxy_idx, proxy in enumerate(proxies, 1):
+            try:
+                if proxy:
+                    log.debug(f"[{code}] пробую прокси {proxy_idx}/{len(proxies)}")
+
+                async with build_client(proxy=proxy) as http:
+                    client = DiscordClient(
+                        http,
+                        limiter,
+                        on_rate_limit=lambda c, delay, scope: log.warning(
+                            "[%s] лимит Discord (scope=%s), пауза %.1f с", c, scope, delay
+                        ),
+                    )
+                    result = await client.check(code)
+
+                if result.status != Status.UNKNOWN:
+                    if proxy:
+                        log.debug(f"[{code}] прокси работает")
+                    break
+
+                if "Timeout" in (result.detail or ""):
+                    if proxy:
+                        log.warning(f"[{code}] прокси не отвечает, переключаюсь")
+                    continue
+
+                break
+
+            except Exception as e:
+                if proxy:
+                    log.warning(f"[{code}] ошибка прокси: {type(e).__name__}")
+                if proxy_idx < len(proxies):
+                    continue
+                result = CheckResult(
+                    code=code,
+                    status=Status.UNKNOWN,
+                    detail=f"все прокси не работают",
+                )
+                break
+
+        if result is None:
+            result = CheckResult(
+                code=code,
+                status=Status.UNKNOWN,
+                detail="не удалось подключиться",
+            )
+
+        results.append(result)
 
     width = max(len(code) for code in codes) + 2
     all_free = True
@@ -170,53 +281,47 @@ async def cmd_watch(config: Config, paths: Paths, targets: list[str]) -> int:
 
     store = Store(paths.state, paths.history)
     limiter = RateLimiter(config.polling.rate_limit_per_second)
-    proxy_pool = ProxyPool(config.proxy.urls)
 
     msg = f"Отслеживается кодов: {len(codes)}, интервал {config.polling.interval_seconds:.0f} с, лимит {config.polling.rate_limit_per_second:.2f} запр/с"
-    if proxy_pool.enabled:
-        msg += f", прокси: {len(config.proxy.urls)} с отказоустойчивостью"
-    if config.proxy.skip_free_hours > 0:
-        msg += f", пропуск свободных: {config.proxy.skip_free_hours:.0f} ч"
+    if config.proxy.urls:
+        msg += f", прокси: {len(config.proxy.urls)} с ротацией при ошибках"
+    if config.polling.skip_free_hours > 0:
+        msg += f", пропуск свободных: {config.polling.skip_free_hours:.0f} ч"
     log.info(msg)
 
-    # Начальная прокси (или None если прокси нет)
-    initial_proxy = proxy_pool.next() if proxy_pool.enabled else None
+    client = ProxyRotatingClient(
+        config,
+        limiter,
+        on_rate_limit=lambda code, delay, scope: log.warning(
+            "[%s] лимит Discord (scope=%s), пауза %.1f с", code, scope, delay
+        ),
+    )
+    watcher = Watcher(
+        codes=codes,
+        client=client,
+        store=store,
+        polling=config.polling,
+        notifier=notifier,
+        skip_free_hours=config.polling.skip_free_hours,
+    )
 
-    async with build_client(proxy=initial_proxy) as http:
-        client = DiscordClient(
-            http,
-            limiter,
-            on_rate_limit=lambda code, delay, scope: log.warning(
-                "[%s] лимит Discord (scope=%s), пауза %.1f с", code, scope, delay
-            ),
-            proxy_pool=proxy_pool,
-        )
-        client._current_proxy = initial_proxy
-        watcher = Watcher(
-            codes=codes,
-            client=client,
-            store=store,
-            polling=config.polling,
-            notifier=notifier,
-            skip_free_hours=config.proxy.skip_free_hours,
-        )
-
-        try:
-            if notifier is not None:
-                try:
-                    await notifier.send(
-                        build_startup_message(codes, config.polling.interval_seconds)
-                    )
-                except TelegramError as exc:
-                    log.error("Telegram отклонил стартовое сообщение: %s", exc)
-                    log.error("Исправьте .env и запустите снова.")
-                    return 2
-            await watcher.run()
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            log.info("Остановлено, состояние сохранено.")
-        finally:
-            if notifier is not None:
-                await notifier.aclose()
+    try:
+        if notifier is not None:
+            try:
+                await notifier.send(
+                    build_startup_message(codes, config.polling.interval_seconds)
+                )
+            except TelegramError as exc:
+                log.error("Telegram отклонил стартовое сообщение: %s", exc)
+                log.error("Исправьте .env и запустите снова.")
+                return 2
+        await watcher.run()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        log.info("Остановлено, состояние сохранено.")
+    finally:
+        if notifier is not None:
+            await notifier.aclose()
+        await client.aclose()
 
     return 0
 
