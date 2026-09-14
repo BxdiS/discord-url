@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import __version__
-from .api import DiscordClient, Status, build_client
+from .api import CheckResult, DiscordClient, Status, build_client
 from .bootstrap import Paths, ensure_working_files, get_paths, load_dotenv
 from .config import Config, ConfigError, load_config
 from .invite import InviteParseError, parse_code, parse_watchlist
@@ -110,19 +110,78 @@ def _report_created(created: list[Path]) -> None:
     )
 
 
-def _make_notifier(config: Config) -> TelegramNotifier | None:
+def _make_notifier(config: Config, proxy: str | None = None) -> TelegramNotifier | None:
     if not config.telegram.enabled:
         return None
 
-    proxy = None
-    if config.proxy.use_for_telegram and config.proxy.urls:
-        proxy = config.proxy.urls[0]
+    use_proxy_for_tg = getattr(config.proxy, 'use_for_telegram', True)
+    tg_proxy = proxy if use_proxy_for_tg else None
+    if tg_proxy:
+        log.info(f"Telegram будет использовать прокси")
+    else:
+        log.info(f"Telegram работает БЕЗ прокси")
 
     return TelegramNotifier(
         config.telegram.bot_token,
         config.telegram.chat_id,
-        proxy=proxy,
+        proxy=tg_proxy,
     )
+
+
+async def _check_one_proxy(proxy: str, test_url: str, timeout: float) -> tuple[str, bool]:
+    """Быстрая проверка одной прокси. Возвращает (proxy, is_working)."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            proxy=proxy,
+            follow_redirects=False,
+        ) as http:
+            response = await http.get(test_url)
+            if response.status_code < 500:
+                return (proxy, True)
+    except Exception:
+        pass
+    return (proxy, False)
+
+
+async def _find_working_proxy(
+    proxies: list[str],
+    test_url: str = "https://discord.com/api/v10/invites/test",
+    timeout: float = 3.0,
+    max_needed: int = 10,
+) -> tuple[str | None, list[str]]:
+    """Параллельно проверяет все прокси. Возвращает (working_proxy, all_working_proxies)."""
+    if not proxies:
+        return None, []
+
+    log.info(f"Параллельная проверка {len(proxies)} прокси (timeout {timeout}s)...")
+
+    all_working = []
+    batch_size = 50
+
+    for batch_start in range(0, len(proxies), batch_size):
+        batch = proxies[batch_start:batch_start + batch_size]
+        tasks = [_check_one_proxy(proxy, test_url, timeout) for proxy in batch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, tuple) and result[1]:
+                all_working.append(result[0])
+
+        # Логируем прогресс батча
+        log.info(f"  Проверено {min(batch_start + batch_size, len(proxies))}/{len(proxies)}, найдено рабочих: {len(all_working)}")
+
+        # Если уже нашли достаточно - останавливаемся
+        if len(all_working) >= max_needed:
+            break
+
+    if all_working:
+        log.info(f"✓ Найдено {len(all_working)} рабочих прокси из {len(proxies)}")
+        return all_working[0], all_working
+    else:
+        log.warning(f"✗ Ни одна прокси из {len(proxies)} не отвечает!")
+        return None, []
 
 
 class ProxyRotatingClient:
@@ -196,58 +255,26 @@ async def cmd_check(config: Config, targets: list[str]) -> int:
     codes = _resolve_targets(targets)
     limiter = RateLimiter(config.polling.rate_limit_per_second)
 
-    proxies = config.proxy.urls if config.proxy.urls else [None]
+    # Health-check прокси - находим рабочую
+    working_proxy = None
+    if config.proxy.urls:
+        working_proxy, _ = await _find_working_proxy(list(config.proxy.urls))
+        if not working_proxy:
+            log.error("Ни одна прокси не работает!")
+            return 1
+
     results = []
-
-    for code in codes:
-        result = None
-        for proxy_idx, proxy in enumerate(proxies, 1):
-            try:
-                if proxy:
-                    log.debug(f"[{code}] пробую прокси {proxy_idx}/{len(proxies)}")
-
-                async with build_client(proxy=proxy) as http:
-                    client = DiscordClient(
-                        http,
-                        limiter,
-                        on_rate_limit=lambda c, delay, scope: log.warning(
-                            "[%s] лимит Discord (scope=%s), пауза %.1f с", c, scope, delay
-                        ),
-                    )
-                    result = await client.check(code)
-
-                if result.status != Status.UNKNOWN:
-                    if proxy:
-                        log.debug(f"[{code}] прокси работает")
-                    break
-
-                if "Timeout" in (result.detail or ""):
-                    if proxy:
-                        log.warning(f"[{code}] прокси не отвечает, переключаюсь")
-                    continue
-
-                break
-
-            except Exception as e:
-                if proxy:
-                    log.warning(f"[{code}] ошибка прокси: {type(e).__name__}")
-                if proxy_idx < len(proxies):
-                    continue
-                result = CheckResult(
-                    code=code,
-                    status=Status.UNKNOWN,
-                    detail=f"все прокси не работают",
-                )
-                break
-
-        if result is None:
-            result = CheckResult(
-                code=code,
-                status=Status.UNKNOWN,
-                detail="не удалось подключиться",
-            )
-
-        results.append(result)
+    async with build_client(proxy=working_proxy) as http:
+        client = DiscordClient(
+            http,
+            limiter,
+            on_rate_limit=lambda c, delay, scope: log.warning(
+                "[%s] лимит Discord (scope=%s), пауза %.1f с", c, scope, delay
+            ),
+        )
+        for code in codes:
+            result = await client.check(code)
+            results.append(result)
 
     width = max(len(code) for code in codes) + 2
     all_free = True
@@ -272,56 +299,80 @@ async def cmd_watch(config: Config, paths: Paths, targets: list[str]) -> int:
         log.error("Список кодов пуст — добавьте строки в %s", paths.watchlist.name)
         return 2
 
-    notifier = _make_notifier(config)
+    store = Store(paths.state, paths.history)
+    limiter = RateLimiter(config.polling.rate_limit_per_second)
+
+    msg = f"Отслеживается кодов: {len(codes)}, интервал {config.polling.interval_seconds:.0f} с, лимит {config.polling.rate_limit_per_second:.2f} запр/с"
+    if config.proxy.urls:
+        msg += f", прокси: {len(config.proxy.urls)} с health-check"
+    if config.polling.skip_free_hours > 0:
+        msg += f", пропуск свободных: {config.polling.skip_free_hours:.0f} ч"
+    log.info(msg)
+
+    # Health-check прокси и выбор рабочей
+    initial_proxy = None
+    working_proxies = []
+    if config.proxy.urls:
+        initial_proxy, working_proxies = await _find_working_proxy(list(config.proxy.urls))
+        if not initial_proxy:
+            log.error("Не найдено рабочих прокси! Демон не запустится.")
+            log.error("Проверьте прокси в proxies.txt или удалите их для работы напрямую.")
+            return 1
+
+    # Создаём Telegram notifier (с прокси если требуется)
+    notifier = _make_notifier(config, proxy=initial_proxy)
     if notifier is None:
         log.warning(
             "Telegram не настроен (TG_BOT_TOKEN / TG_CHAT_ID в .env пусты) — "
             "алерты будут только в этой консоли."
         )
 
-    store = Store(paths.state, paths.history)
-    limiter = RateLimiter(config.polling.rate_limit_per_second)
+    async with build_client(proxy=initial_proxy) as http:
+        client = DiscordClient(
+            http,
+            limiter,
+            on_rate_limit=lambda code, delay, scope: log.warning(
+                "[%s] лимит Discord (scope=%s), пауза %.1f с", code, scope, delay
+            ),
+        )
+        watcher = Watcher(
+            codes=codes,
+            client=client,
+            store=store,
+            polling=config.polling,
+            notifier=notifier,
+            skip_free_hours=config.polling.skip_free_hours,
+        )
 
-    msg = f"Отслеживается кодов: {len(codes)}, интервал {config.polling.interval_seconds:.0f} с, лимит {config.polling.rate_limit_per_second:.2f} запр/с"
-    if config.proxy.urls:
-        msg += f", прокси: {len(config.proxy.urls)} с ротацией при ошибках"
-    if config.polling.skip_free_hours > 0:
-        msg += f", пропуск свободных: {config.polling.skip_free_hours:.0f} ч"
-    log.info(msg)
+        try:
+            # Стартовое сообщение в Telegram - с таймаутом чтобы не блокировать демон
+            if notifier is not None:
+                try:
+                    log.info("Отправка стартового сообщения в Telegram (таймаут 5с)...")
+                    await asyncio.wait_for(
+                        notifier.send(
+                            build_startup_message(codes, config.polling.interval_seconds)
+                        ),
+                        timeout=5.0,
+                    )
+                    log.info("✓ Telegram работает, уведомления включены")
+                except (TelegramError, asyncio.TimeoutError, Exception) as exc:
+                    log.warning("⚠ Telegram недоступен: %s", type(exc).__name__)
+                    log.warning("Демон продолжит работать БЕЗ уведомлений в Telegram")
+                    # Отключаем notifier чтобы watcher его не использовал
+                    await notifier.aclose()
+                    notifier = None
+                    watcher._notifier = None
 
-    client = ProxyRotatingClient(
-        config,
-        limiter,
-        on_rate_limit=lambda code, delay, scope: log.warning(
-            "[%s] лимит Discord (scope=%s), пауза %.1f с", code, scope, delay
-        ),
-    )
-    watcher = Watcher(
-        codes=codes,
-        client=client,
-        store=store,
-        polling=config.polling,
-        notifier=notifier,
-        skip_free_hours=config.polling.skip_free_hours,
-    )
-
-    try:
-        if notifier is not None:
-            try:
-                await notifier.send(
-                    build_startup_message(codes, config.polling.interval_seconds)
-                )
-            except TelegramError as exc:
-                log.error("Telegram отклонил стартовое сообщение: %s", exc)
-                log.error("Исправьте .env и запустите снова.")
-                return 2
-        await watcher.run()
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        log.info("Остановлено, состояние сохранено.")
-    finally:
-        if notifier is not None:
-            await notifier.aclose()
-        await client.aclose()
+            log.info("=" * 60)
+            log.info("Демон запущен, начинаю проверку кодов...")
+            log.info("=" * 60)
+            await watcher.run()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            log.info("Остановлено, состояние сохранено.")
+        finally:
+            if notifier is not None:
+                await notifier.aclose()
 
     return 0
 
@@ -333,15 +384,30 @@ async def cmd_test_notify(config: Config) -> int:
         )
         return 2
 
-    notifier = _make_notifier(config)
+    # Health-check прокси для Telegram
+    working_proxy = None
+    use_proxy_for_tg = getattr(config.proxy, 'use_for_telegram', True)
+    if use_proxy_for_tg and config.proxy.urls:
+        working_proxy, _ = await _find_working_proxy(list(config.proxy.urls))
+        if not working_proxy:
+            log.warning("Прокси не работают, попробую напрямую...")
+
+    notifier = _make_notifier(config, proxy=working_proxy)
     assert notifier is not None
     try:
-        username = await notifier.whoami()
-        await notifier.send(
-            "✅ <b>dcurl на связи.</b>\nЕсли вы это видите — уведомления работают."
+        log.info("Отправка тестового сообщения (таймаут 10с)...")
+        username = await asyncio.wait_for(notifier.whoami(), timeout=10.0)
+        await asyncio.wait_for(
+            notifier.send(
+                "✅ <b>dcurl на связи.</b>\nЕсли вы это видите — уведомления работают."
+            ),
+            timeout=10.0,
         )
         print(f"Отправлено. Бот: @{username}")
         return 0
+    except asyncio.TimeoutError:
+        log.error("Telegram не ответил за 10 секунд - прокси не поддерживает HTTPS")
+        return 2
     except TelegramError as exc:
         log.error("Telegram отклонил запрос: %s", exc)
         return 2
