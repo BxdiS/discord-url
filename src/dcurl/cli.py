@@ -14,7 +14,6 @@ from .api import DiscordClient, Status, build_client
 from .bootstrap import Paths, ensure_working_files, get_paths, load_dotenv
 from .config import Config, ConfigError, load_config
 from .proxy import ProxyRotator
-from .proxy_pool import ProxyPool
 from .invite import InviteParseError, parse_code, parse_watchlist
 from .limiter import RateLimiter
 from .messages import build_startup_message, describe_taken
@@ -235,9 +234,7 @@ async def cmd_watch(config: Config, paths: Paths, targets: list[str]) -> int:
             on_rate_limit=lambda code, delay, scope: log.warning(
                 "[%s] лимит Discord (scope=%s), пауза %.1f с", code, scope, delay
             ),
-            proxy_pool=proxy_pool,
         )
-        client._current_proxy = initial_proxy
         watcher = Watcher(
             codes=codes,
             client=client,
