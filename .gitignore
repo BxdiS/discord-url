@@ -4,6 +4,11 @@ config.toml
 .env
 watchlist.txt
 
+# Прокси-списки с реальными учётными данными — никогда не коммитить.
+proxies.txt
+proxies.txt.local
+*.local
+
 # Локальное состояние
 state.json
 history.jsonl
