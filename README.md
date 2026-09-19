@@ -200,6 +200,41 @@ dcurl watch discord.gg/one discord.gg/two --interval 30
 | `state.json` | последний статус каждого кода; переживает перезапуск, чтобы алерт не повторился |
 | `history.jsonl` | журнал переходов: когда, что, как долго держалось |
 
+## Деплой на сервере
+
+Для запуска на VPS (Ubuntu 24.04) есть готовые скрипты в папке `deploy/`.
+
+### Первый запуск через cloud-init
+
+Вставьте содержимое `deploy/cloud-init.yml` в поле Cloud-init при создании
+сервера. После загрузки:
+
+```bash
+# Заполните токены
+nano /opt/dcurl/.env
+
+# Заполните список кодов
+nano /opt/dcurl/data/watchlist.txt
+
+# Запустите демон
+systemctl start dcurl
+systemctl status dcurl
+
+# Смотрите логи
+journalctl -u dcurl -f
+```
+
+`DCURL_HOME` указывает на `/opt/dcurl/data` — там живут `config.toml`,
+`watchlist.txt`, `state.json` и `history.jsonl`.
+
+### Обновление
+
+```bash
+bash /opt/dcurl/repo/deploy/update.sh
+```
+
+Скрипт делает `git pull`, обновляет зависимости и перезапускает службу.
+
 ## Разработка
 
 ```bash
