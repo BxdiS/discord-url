@@ -40,7 +40,7 @@ class TelegramConfig:
 @dataclass(frozen=True)
 class ProxyConfig:
     urls: list[str] = None
-    use_for_telegram: bool = True
+    use_for_telegram: bool = False
 
     def __post_init__(self) -> None:
         if self.urls is None:
