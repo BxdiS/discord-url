@@ -41,8 +41,9 @@ urls = []
 # urls = "proxies.txt"
 # urls = ["http://user:pass@proxy1:8080", "http://user:pass@proxy2:8080"]
 
-# Использовать прокси и для Telegram уведомлений (по умолчанию true)
-use_for_telegram = true
+# Использовать прокси и для Telegram уведомлений.
+# По умолчанию false: бот развёрнут в Европе, Telegram доступен напрямую.
+use_for_telegram = false
 
 # Свежие свободные коды не проверяются N часов (когда используются прокси)
 skip_free_hours = 12.0

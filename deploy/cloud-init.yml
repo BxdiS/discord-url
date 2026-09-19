@@ -1,0 +1,72 @@
+#cloud-config
+# dcurl — cloud-init для Ubuntu 24.04 (Timeweb / любой VPS)
+# Вставьте этот файл в поле Cloud-init при создании сервера.
+# После загрузки зайдите по SSH и задайте токены:
+#   nano /opt/dcurl/.env
+# Затем запустите:
+#   systemctl start dcurl
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - python3
+  - python3-pip
+  - python3-venv
+  - git
+  - curl
+
+write_files:
+  - path: /etc/systemd/system/dcurl.service
+    content: |
+      [Unit]
+      Description=dcurl — Discord invite monitor
+      After=network.target
+
+      [Service]
+      Type=simple
+      User=dcurl
+      WorkingDirectory=/opt/dcurl/repo
+      ExecStart=/opt/dcurl/venv/bin/python -m dcurl watch
+      EnvironmentFile=/opt/dcurl/.env
+      Restart=always
+      RestartSec=10
+      Environment=PYTHONUNBUFFERED=1
+      Environment=DCURL_HOME=/opt/dcurl/data
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/logrotate.d/dcurl
+    content: |
+      /var/log/dcurl/*.log {
+          daily
+          rotate 14
+          compress
+          delaycompress
+          missingok
+          notifempty
+          copytruncate
+      }
+
+  - path: /opt/dcurl/.env
+    permissions: '0600'
+    content: |
+      # Токен бота: @BotFather -> /newbot
+      TG_BOT_TOKEN=CHANGE_ME
+      # ID чата: @userinfobot (для группы — ID начинается с минуса)
+      TG_CHAT_ID=CHANGE_ME
+
+runcmd:
+  - useradd -r -m -d /opt/dcurl -s /bin/bash dcurl
+  - mkdir -p /opt/dcurl/data /var/log/dcurl
+  - git clone https://github.com/BxdiS/discord-url.git /opt/dcurl/repo
+  - python3 -m venv /opt/dcurl/venv
+  - /opt/dcurl/venv/bin/pip install --upgrade pip -q
+  - /opt/dcurl/venv/bin/pip install -r /opt/dcurl/repo/requirements.txt -q
+  - cp /opt/dcurl/repo/watchlist.example.txt /opt/dcurl/data/watchlist.txt
+  - cp /opt/dcurl/repo/config.example.toml /opt/dcurl/data/config.toml
+  - chown -R dcurl:dcurl /opt/dcurl /var/log/dcurl
+  - systemctl daemon-reload
+  - systemctl enable dcurl
+  - echo ">>> dcurl установлен. Заполните /opt/dcurl/.env и /opt/dcurl/data/watchlist.txt, затем: systemctl start dcurl"
